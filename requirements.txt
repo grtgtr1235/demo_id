@@ -1,0 +1,12 @@
+streamlit
+streamlit-folium
+folium
+feedparser
+httpx
+trafilatura
+lxml
+dateparser
+spacy
+requests
+geopy
+pandas
