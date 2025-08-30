@@ -9,6 +9,5 @@ dateparser==1.2.0
 requests==2.32.3
 geopy==2.4.1
 pandas==2.2.2
-
 spacy==3.8.2
 https://github.com/explosion/spacy-models/releases/download/xx_ent_wiki_sm-3.8.0/xx_ent_wiki_sm-3.8.0-py3-none-any.whl
