@@ -4,16 +4,17 @@ from urllib.parse import quote_plus, urlparse
 import feedparser, httpx, pandas as pd, requests, trafilatura, dateparser
 
 # --- NER (spaCy multilingual kecil) ---
-import spacy
-from spacy.cli import download as spacy_download
-_NLP=None
+_NLP = None
 def ensure_nlp():
+    """Load spaCy model if available; otherwise return None (we'll rely on regex)."""
     global _NLP
-    if _NLP is not None: return _NLP
-    try: _NLP = spacy.load("xx_ent_wiki_sm")
-    except Exception:
-        spacy_download("xx_ent_wiki_sm")
+    if _NLP is not None:
+        return _NLP
+    try:
+        import spacy
         _NLP = spacy.load("xx_ent_wiki_sm")
+    except Exception:
+        _NLP = None
     return _NLP
 
 # --- Regex alamat Indonesia ---
@@ -22,7 +23,7 @@ ADDR_RE = re.compile(
     re.I
 )
 
-# Landmark sering muncul → direct hit (tanpa geocoder)
+# Landmark → direct hit (tanpa geocoder)
 PRIORITY_PLACES = {
   "gedung dpr": (-6.2128, 106.8006, "Gedung MPR/DPR/DPD RI, Senayan"),
   "gedung mpr": (-6.2128, 106.8006, "Gedung MPR/DPR/DPD RI, Senayan"),
@@ -30,10 +31,10 @@ PRIORITY_PLACES = {
   "istana merdeka": (-6.1701, 106.8247, "Istana Merdeka"),
   "monas": (-6.175392, 106.827153, "Monumen Nasional")
 }
-UA = os.getenv("APP_USER_AGENT", "id-demo-mapper/1.2 (contact: you@example.com)")
+UA = os.getenv("APP_USER_AGENT", "id-demo-mapper/1.3 (contact: you@example.com)")
 PHOTON = "https://photon.komoot.io/api"
 
-# Nominatim sebagai fallback (rate-limit internal via geopy RateLimiter)
+# Nominatim fallback (RateLimiter)
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 _GEOCODER = Nominatim(user_agent=UA, timeout=20)
@@ -52,8 +53,9 @@ def extract_locs(text):
     nlp = ensure_nlp()
     locs=[]
     if text:
-        doc=nlp(text)
-        locs += [e.text.strip() for e in doc.ents if e.label_ in ("LOC","GPE")]
+        if nlp is not None:
+            doc=nlp(text)
+            locs += [e.text.strip() for e in doc.ents if e.label_ in ("LOC","GPE")]
         locs += [m.group(0) for m in ADDR_RE.finditer(text)]
     uniq,seen=[],set()
     for l in locs:
@@ -164,7 +166,7 @@ def main():
         published=getattr(e,"published","") or getattr(e,"updated","")
         rows.append({"id":hashlib.md5(link.encode()).hexdigest(),
                      "title":title,"source_url":link,"source_domain":urlparse(link).netloc,
-                     "published_at_utc":dateparser.parse(published).isoformat() if published else None})
+                     "published_at_utc":parse_date_any(published)})
         urls.append(link)
     if not rows:
         pd.DataFrame([]).to_csv(args.out,index=False); print("No results."); return
