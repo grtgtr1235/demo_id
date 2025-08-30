@@ -1,10 +1,9 @@
 import streamlit as st, pandas as pd, subprocess, sys, os
 import folium
 from folium.plugins import MarkerCluster
-from zoneinfo import ZoneInfo
 
 # =========================
-# Render peta: pakai streamlit_folium jika ada; jika tidak, fallback ke components.html
+# Render peta: streamlit_folium jika ada; fallback ke components.html
 # =========================
 try:
     from streamlit_folium import st_folium
@@ -16,7 +15,6 @@ except Exception:
 # =========================
 # Konfigurasi umum
 # =========================
-TZ = ZoneInfo("Asia/Jakarta")          # GMT+7
 RESULT_PATH = "result.csv"
 
 st.set_page_config(page_title="Peta Demo/Protes Indonesia", layout="wide")
@@ -35,7 +33,7 @@ with st.sidebar:
     run = st.button("Jalankan Crawling")
 
 # =========================
-# Helper
+# Helpers
 # =========================
 def run_crawl():
     """Jalankan crawler sebagai proses terpisah."""
@@ -52,8 +50,7 @@ def run_crawl():
         subprocess.run(cmd, check=False)
 
 def load_df() -> pd.DataFrame:
-    """Muat CSV hasil crawling. Aman jika file kosong atau belum ada.
-    Tambahkan kolom waktu GMT+7 untuk tampilan & filter."""
+    """Muat CSV hasil crawling. Aman jika file kosong/belum ada. Pastikan kolom UTC tz-aware."""
     if not os.path.exists(RESULT_PATH) or os.path.getsize(RESULT_PATH) == 0:
         return pd.DataFrame()
     try:
@@ -62,20 +59,18 @@ def load_df() -> pd.DataFrame:
         return pd.DataFrame()
 
     if "published_at_utc" in df.columns:
-        utc = pd.to_datetime(df["published_at_utc"], errors="coerce", utc=True)
-        df["published_at_utc"] = utc
-        df["published_at_gmt7"] = utc.dt.tz_convert(TZ)
+        # pastikan tz-aware UTC
+        df["published_at_utc"] = pd.to_datetime(df["published_at_utc"], errors="coerce", utc=True)
     return df
 
 def draw_map(df: pd.DataFrame):
-    """Gambar peta Folium dengan marker cluster."""
     m = folium.Map(location=[-2.5, 117], zoom_start=5, control_scale=True)
     if df is not None and not df.empty and {"lat","lon"}.issubset(df.columns):
         mc = MarkerCluster().add_to(m)
         for _, r in df.dropna(subset=["lat","lon"]).iterrows():
             popup = folium.Popup(f"""
                 <b>{r.get('title','')}</b><br>
-                <small>{r.get('published_at_gmt7')}</small><br>
+                <small>{r.get('published_at_utc')}</small><br>
                 <i>{r.get('mention_phrase','')}</i><br>
                 {(r.get('street') or r.get('place_name') or '')}<br>
                 {(r.get('kecamatan','') or '')}, {(r.get('kab_kota','') or '')}, {(r.get('provinsi','') or '')}<br>
@@ -96,7 +91,7 @@ if run:
     st.success("Selesai. Hasil terbaru di bawah.")
 
 # =========================
-# Muat data & bangun UI (Tabs)
+# Muat data & UI (Tabs)
 # =========================
 df = load_df()
 tab_map, tab_table = st.tabs(["🗺️ Peta", "📊 Tabel"])
@@ -124,10 +119,10 @@ with tab_table:
             provs = sorted(df["provinsi"].dropna().unique()) if "provinsi" in df.columns else []
             sel_prov = st.multiselect("Filter provinsi", provs, default=provs[:10] if len(provs)>10 else provs)
         with col3:
-            if "published_at_gmt7" in df.columns and df["published_at_gmt7"].notna().any():
-                min_d = pd.to_datetime(df["published_at_gmt7"].min()).date()
-                max_d = pd.to_datetime(df["published_at_gmt7"].max()).date()
-                dr = st.date_input("Rentang tanggal (GMT+7)", (min_d, max_d))
+            if "published_at_utc" in df.columns and df["published_at_utc"].notna().any():
+                min_d = pd.to_datetime(df["published_at_utc"].min()).date()
+                max_d = pd.to_datetime(df["published_at_utc"].max()).date()
+                dr = st.date_input("Rentang tanggal (UTC)", (min_d, max_d))
             else:
                 dr = None
 
@@ -136,29 +131,30 @@ with tab_table:
             df_f = df_f[df_f["topic_tag"].isin(sel_topics)]
         if "provinsi" in df_f.columns and sel_prov:
             df_f = df_f[df_f["provinsi"].isin(sel_prov)]
-        if dr and isinstance(dr, tuple) and len(dr) == 2 and "published_at_gmt7" in df_f.columns:
-            # batas tz-aware di GMT+7; end eksklusif (tambah 1 hari)
-            start = pd.Timestamp(dr[0], tz=TZ)
-            end = pd.Timestamp(dr[1], tz=TZ) + pd.Timedelta(days=1)
-            df_f = df_f[(df_f["published_at_gmt7"] >= start) & (df_f["published_at_gmt7"] < end)]
+
+        # Filter tanggal: semua tz-aware UTC (hindari TypeError)
+        if dr and isinstance(dr, tuple) and len(dr) == 2 and "published_at_utc" in df_f.columns:
+            start = pd.Timestamp(dr[0], tz="UTC")
+            end = pd.Timestamp(dr[1], tz="UTC") + pd.Timedelta(days=1)  # end eksklusif
+            df_f = df_f[(df_f["published_at_utc"] >= start) & (df_f["published_at_utc"] < end)]
 
         show_cols = [c for c in [
-            "published_at_gmt7","title","topic_tag","mention_phrase",
+            "published_at_utc","title","topic_tag","mention_phrase",
             "street","place_name","kecamatan","kab_kota","provinsi",
             "geocoder","geocode_score","source_domain","source_url"
         ] if c in df_f.columns]
 
         st.dataframe(
-            df_f[show_cols].sort_values("published_at_gmt7", ascending=False, na_position="last"),
+            df_f[show_cols].sort_values("published_at_utc", ascending=False, na_position="last"),
             use_container_width=True, height=520
         )
 
         st.download_button(
-            "⬇️ Unduh CSV (hasil filter, GMT+7)",
+            "⬇️ Unduh CSV (hasil filter, UTC)",
             data=df_f[show_cols].to_csv(index=False).encode("utf-8"),
-            file_name="demo_crawl_gmt7_filtered.csv",
+            file_name="demo_crawl_utc_filtered.csv",
             mime="text/csv"
         )
 
 st.markdown("---")
-st.caption("Waktu ditampilkan dalam GMT+7 (Asia/Jakarta). Aktifkan 'Hanya media Indonesia' di sidebar untuk menyaring domain non-ID.")
+st.caption("Waktu ditampilkan & difilter dalam UTC. Centang 'Hanya media Indonesia' agar domain non-ID disaring.")
