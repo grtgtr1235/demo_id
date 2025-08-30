@@ -1,132 +1,396 @@
-import streamlit as st, pandas as pd, subprocess, sys, os
-import folium
-from folium.plugins import MarkerCluster
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# Render peta
-try:
-    from streamlit_folium import st_folium
-    def render_map(m): st_folium(m, height=650, use_container_width=True)
-except Exception:
-    import streamlit.components.v1 as components
-    def render_map(m): components.html(m._repr_html_(), height=650, scrolling=False)
+import argparse, asyncio, json, os, re, time, hashlib, math
+from urllib.parse import quote_plus, urlparse
 
-RESULT_PATH = "result.csv"
-st.set_page_config(page_title="Peta Demo/Protes Indonesia", layout="wide")
-st.title("Peta Demo/Protes Indonesia (News Crawler)")
+import feedparser
+import httpx
+import pandas as pd
+import requests
+import trafilatura
+import dateparser
+from zoneinfo import ZoneInfo
 
-with st.sidebar:
-    st.header("Filter Crawling")
-    inc = st.text_input("Keyword include (koma)", "demo,protes,kerusuhan")
-    when = st.selectbox("Rentang waktu", ["12h","24h","48h","72h","7d"], index=1)
-    province = st.text_input("Bias provinsi (opsional)", "")
-    mode = st.radio("Mode crawling", ["fast (judul)", "full (ambil isi)"], index=0)
-    id_only = st.checkbox("Hanya media Indonesia", value=True)
-    wide = st.checkbox("Perluas query (provinsi+kota se-Indonesia)", value=True)
-    target = st.slider("Target artikel", 100, 1200, 500, step=50)
-    run = st.button("Jalankan Crawling")
+# =========================
+# KONFIG
+# =========================
+UA = os.getenv("APP_USER_AGENT", "id-demo-mapper/1.8 (contact: you@example.com)")
+PHOTON = "https://photon.komoot.io/api"
+UTC = ZoneInfo("UTC")
+MAX_PER_FEED = 100  # kapasitas kira-kira per feed Google News RSS
 
-def run_crawl():
-    cmd = [sys.executable, "rss_crawl_fast.py",
-           "--include", inc, "--when", when,
-           "--mode", "fast" if mode.startswith("fast") else "full",
-           "--out", RESULT_PATH,
-           "--target", str(target)]
-    if province.strip(): cmd += ["--province", province.strip()]
-    if id_only: cmd += ["--id-media-only"]
-    if wide: cmd += ["--wide"]
-    with st.spinner("Crawling..."):
-        subprocess.run(cmd, check=False)
-
-def load_df():
-    if not os.path.exists(RESULT_PATH) or os.path.getsize(RESULT_PATH) == 0:
-        return pd.DataFrame()
+# =========================
+# spaCy NER (fallback jika gagal)
+# =========================
+_NLP = None
+def ensure_nlp():
+    global _NLP
+    if _NLP is not None:
+        return _NLP
     try:
-        df = pd.read_csv(RESULT_PATH)
-    except pd.errors.EmptyDataError:
-        return pd.DataFrame()
-    if "published_at_utc" in df.columns:
-        df["published_at_utc"] = pd.to_datetime(df["published_at_utc"], errors="coerce", utc=True)
-    return df
+        import spacy
+        _NLP = spacy.load("xx_ent_wiki_sm")
+    except Exception:
+        _NLP = None
+    return _NLP
 
-def draw_map(df):
-    m = folium.Map(location=[-2.5, 117], zoom_start=5, control_scale=True)
-    if df is not None and not df.empty and {"lat","lon"}.issubset(df.columns):
-        mc = MarkerCluster().add_to(m)
-        for _, r in df.dropna(subset=["lat","lon"]).iterrows():
-            popup = folium.Popup(f"""
-                <b>{r.get('title','')}</b><br>
-                <small>{r.get('published_at_utc')}</small><br>
-                <i>{r.get('mention_phrase','')}</i><br>
-                {(r.get('street') or r.get('place_name') or '')}<br>
-                {(r.get('kecamatan','') or '')}, {(r.get('kab_kota','') or '')}, {(r.get('provinsi','') or '')}<br>
-                <a href="{r.get('source_url','')}" target="_blank">Baca sumber</a>
-            """, max_width=350)
-            folium.Marker([r["lat"], r["lon"]], tooltip=r.get("topic_tag",""), popup=popup).add_to(mc)
-    render_map(m)
+# =========================
+# Regex alamat Indonesia
+# =========================
+ADDR_RE = re.compile(
+    r"(?:di\s+)?(?:(?:Jl|Jln|Jalan|Gg)\.?\s+[A-Z0-9][^,.;\n]+|Kantor\s+DPRD[^,.;\n]+|"
+    r"DPRD\s+[A-Z][^,.;\n]+|Polres[^,.;\n]+|Polresta[^,.;\n]+|Polda[^,.;\n]+|"
+    r"Mapolda[^,.;\n]+|Gedung\s+DPR[^,.;\n]+)",
+    re.I
+)
 
-if run:
-    run_crawl()
-    st.success("Selesai. Hasil terbaru di bawah.")
+# =========================
+# Landmark → koordinat langsung
+# =========================
+PRIORITY_PLACES = {
+    "gedung dpr": (-6.2128, 106.8006, "Gedung MPR/DPR/DPD RI, Senayan"),
+    "gedung mpr": (-6.2128, 106.8006, "Gedung MPR/DPR/DPD RI, Senayan"),
+    "polda metro jaya": (-6.2265, 106.8085, "Polda Metro Jaya"),
+    "istana merdeka": (-6.1701, 106.8247, "Istana Merdeka"),
+    "monas": (-6.175392, 106.827153, "Monumen Nasional"),
+}
 
-df = load_df()
-tab_map, tab_table = st.tabs(["🗺️ Peta", "📊 Tabel"])
+# =========================
+# Geocoding (Nominatim + RateLimiter)
+# =========================
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+_GEOCODER = Nominatim(user_agent=UA, timeout=20)
+_geocode = RateLimiter(_GEOCODER.geocode, min_delay_seconds=1.1, swallow_exceptions=True)
 
-with tab_map:
-    if df.empty:
-        st.warning("Belum ada data. Klik **Jalankan Crawling** di sidebar.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        with c1: st.metric("Total artikel", len(df))
-        with c2: st.metric("Titik tergeocode", int(df[["lat","lon"]].notna().all(axis=1).sum()))
-        with c3: st.metric("Sumber unik", df["source_domain"].nunique() if "source_domain" in df.columns else 0)
-        draw_map(df)
+# =========================
+# Utils dasar
+# =========================
+def gnews_rss(query, when="24h", lang="id", country="ID"):
+    q = quote_plus(query)
+    return f"https://news.google.com/rss/search?q={q}+when:{when}&hl={lang}&gl={country}&ceid={country}:{lang}"
 
-with tab_table:
-    if df.empty:
-        st.info("Belum ada data untuk ditampilkan.")
-    else:
-        col1, col2, col3 = st.columns([1,1,2])
-        with col1:
-            topics = sorted(df["topic_tag"].dropna().unique()) if "topic_tag" in df.columns else []
-            sel_topics = st.multiselect("Filter topik", topics, default=topics)
-        with col2:
-            provs = sorted(df["provinsi"].dropna().unique()) if "provinsi" in df.columns else []
-            sel_prov = st.multiselect("Filter provinsi", provs, default=provs[:10] if len(provs)>10 else provs)
-        with col3:
-            if "published_at_utc" in df.columns and df["published_at_utc"].notna().any():
-                min_d = pd.to_datetime(df["published_at_utc"].min()).date()
-                max_d = pd.to_datetime(df["published_at_utc"].max()).date()
-                dr = st.date_input("Rentang tanggal (UTC)", (min_d, max_d))
-            else:
-                dr = None
+def parse_date_utc(s: str):
+    """Kembalikan ISO 8601 UTC (tz-aware) atau None."""
+    if not s:
+        return None
+    dt = dateparser.parse(
+        s,
+        languages=["id", "en"],
+        settings={"RETURN_AS_TIMEZONE_AWARE": True}
+    )
+    if dt is None:
+        return None
+    return dt.astimezone(UTC).isoformat()
 
-        df_f = df.copy()
-        if "topic_tag" in df_f.columns and sel_topics:
-            df_f = df_f[df_f["topic_tag"].isin(sel_topics)]
-        if "provinsi" in df_f.columns and sel_prov:
-            df_f = df_f[df_f["provinsi"].isin(sel_prov)]
-        if dr and isinstance(dr, tuple) and len(dr) == 2 and "published_at_utc" in df_f.columns:
-            start = pd.Timestamp(dr[0], tz="UTC")
-            end = pd.Timestamp(dr[1], tz="UTC") + pd.Timedelta(days=1)
-            df_f = df_f[(df_f["published_at_utc"] >= start) & (df_f["published_at_utc"] < end)]
+def normalize_domain(url: str) -> str:
+    d = urlparse(url).netloc.lower()
+    if d.startswith("www."): d = d[4:]
+    if d.startswith("amp."): d = d[4:]
+    return d
 
-        show_cols = [c for c in [
-            "published_at_utc","title","topic_tag","mention_phrase",
-            "street","place_name","kecamatan","kab_kota","provinsi",
-            "geocoder","geocode_score","source_domain","source_url","q_src"
-        ] if c in df_f.columns]
+def is_indonesian_media(domain: str) -> bool:
+    """Heuristik: TLD .id atau domain media Indonesia populer."""
+    if not domain:
+        return False
+    d = domain.lower()
+    if d.endswith(".id"):
+        return True
+    whitelist = [
+        "kompas.com","detik.com","tempo.co","cnnindonesia.com","cnbcindonesia.com",
+        "liputan6.com","merdeka.com","republika.co.id","antaranews.com","tribunnews.com",
+        "jawapos.com","okezone.com","sindonews.com","kumparan.com","tirto.id","suara.com",
+        "inews.id","medcom.id","viva.co.id","idntimes.com","rmol.id","pikiran-rakyat.com",
+        "beritasatu.com"
+    ]
+    return any(d.endswith(w) for w in whitelist)
 
-        st.dataframe(
-            df_f[show_cols].sort_values("published_at_utc", ascending=False, na_position="last"),
-            use_container_width=True, height=520
-        )
+def extract_locs(text: str):
+    """Gabungkan NER (jika ada) + regex → kandidat lokasi unik (prioritas frasa panjang)."""
+    nlp = ensure_nlp()
+    locs = []
+    if text:
+        if nlp is not None:
+            doc = nlp(text)
+            locs += [e.text.strip() for e in doc.ents if e.label_ in ("LOC","GPE")]
+        locs += [m.group(0) for m in ADDR_RE.finditer(text)]
+    uniq, seen = [], set()
+    for l in locs:
+        k = l.lower()
+        if k not in seen and len(l) >= 3:
+            uniq.append(l); seen.add(k)
+    uniq.sort(key=lambda x: (-len(x), x))
+    return uniq
 
-        st.download_button(
-            "⬇️ Unduh CSV (hasil filter, UTC)",
-            data=df_f[show_cols].to_csv(index=False).encode("utf-8"),
-            file_name="demo_crawl_utc_filtered.csv",
-            mime="text/csv"
-        )
+def classify_topic(text: str):
+    s = (text or "").lower()
+    if "affan" in s: return "AFFAN"
+    if any(k in s for k in ["polisi","brimob","polda","polres","polresta"]): return "POLISI"
+    if any(k in s for k in ["dpr","parlemen","gedung dpr"]): return "DPR"
+    return "UMUM"
 
-st.markdown("---")
-st.caption("Mode 'Perluas query' akan membangkitkan otomatis demo+provinsi OR demo+kota untuk seluruh Indonesia. Waktu difilter dalam UTC.")
+def geo_priority(q_lower: str):
+    for k, (lat, lon, name) in PRIORITY_PLACES.items():
+        if k in q_lower:
+            return {"lat":lat,"lon":lon,"place_name":name,"geocoder":"priority","score":1.0}
+
+def geo_photon(q, province=None):
+    try:
+        qs = q if not province else f"{q}, {province}"
+        r = requests.get(PHOTON, params={"q":qs,"lang":"id"}, timeout=15, headers={"User-Agent":UA})
+        r.raise_for_status()
+        feats = r.json().get("features",[])
+        if feats:
+            f=feats[0]; lon,lat = f["geometry"]["coordinates"]
+            p=f.get("properties",{})
+            return {"lat":lat,"lon":lon,"geocoder":"photon","score":0.6,
+                    "street":p.get("street"),"place_name":p.get("name"),
+                    "kecamatan":p.get("city_district") or p.get("suburb"),
+                    "kab_kota":p.get("city") or p.get("county"),
+                    "provinsi":p.get("state")}
+    except Exception:
+        pass
+
+def geo_nominatim(q, province=None):
+    try:
+        qs = q if not province else f"{q}, {province}"
+        res = _geocode(qs, exactly_one=True, addressdetails=True)
+        if res:
+            a=res.raw.get("address",{})
+            return {"lat":res.latitude,"lon":res.longitude,"geocoder":"nominatim","score":0.8,
+                    "street":a.get("road") or a.get("pedestrian"),
+                    "place_name":a.get("public_building") or a.get("tourism") or a.get("building"),
+                    "kecamatan":a.get("suburb") or a.get("city_district") or a.get("district"),
+                    "kab_kota":a.get("city") or a.get("county"),
+                    "provinsi":a.get("state")}
+    except Exception:
+        pass
+
+def geocode_candidates(cands, province=None, cache_path="geocode_cache.json"):
+    cache={}
+    if os.path.exists(cache_path):
+        try: cache=json.load(open(cache_path,"r",encoding="utf-8"))
+        except Exception: cache={}
+    out={}
+    for cand in cands:
+        key=cand.lower()+("|"+province.lower() if province else "")
+        if key in cache:
+            out[cand]=cache[key]; continue
+        hit = geo_priority(key) or geo_photon(cand, province) or geo_nominatim(cand, province)
+        out[cand]=hit; cache[key]=hit
+        time.sleep(0.1)
+    try: json.dump(cache, open(cache_path,"w",encoding="utf-8"))
+    except Exception: pass
+    return out
+
+# =========================
+# Fetch HTML paralel (untuk mode 'full')
+# =========================
+async def fetch_html(urls, mode="fast", max_concurrency=12):
+    if mode=="fast":
+        return {u:"" for u in urls}
+    sem = asyncio.Semaphore(max_concurrency)
+    async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent":UA}) as client:
+        async def one(u):
+            async with sem:
+                try:
+                    r=await client.get(u, timeout=25); r.raise_for_status()
+                    return u,r.text
+                except Exception:
+                    return u,""
+        res=await asyncio.gather(*[one(u) for u in urls])
+        return dict(res)
+
+def extract_text(html, url):
+    if not html: return ""
+    try:
+        return trafilatura.extract(html, include_comments=False, include_tables=False, url=url) or ""
+    except Exception:
+        return ""
+
+# =========================
+# Build query wilayah: "demo {Provinsi} OR demo {Kota(,Kota2,...)}"
+# =========================
+def build_region_queries():
+    # 38 provinsi + kota utama/ibu kota (beberapa provinsi >1 kota untuk cakupan)
+    prov_kota = [
+        ("Aceh", ["Banda Aceh"]),
+        ("Sumatera Utara", ["Medan"]),
+        ("Sumatera Barat", ["Padang"]),
+        ("Riau", ["Pekanbaru"]),
+        ("Kepulauan Riau", ["Tanjungpinang","Batam"]),
+        ("Jambi", ["Jambi"]),
+        ("Bengkulu", ["Bengkulu"]),
+        ("Sumatera Selatan", ["Palembang"]),
+        ("Bangka Belitung", ["Pangkalpinang"]),
+        ("Lampung", ["Bandar Lampung"]),
+        ("Banten", ["Serang"]),
+        ("DKI Jakarta", ["Jakarta"]),
+        ("Jawa Barat", ["Bandung"]),
+        ("Jawa Tengah", ["Semarang"]),
+        ("DI Yogyakarta", ["Yogyakarta"]),
+        ("Jawa Timur", ["Surabaya"]),
+        ("Bali", ["Denpasar"]),
+        ("Nusa Tenggara Barat", ["Mataram"]),
+        ("Nusa Tenggara Timur", ["Kupang"]),
+        ("Kalimantan Barat", ["Pontianak"]),
+        ("Kalimantan Tengah", ["Palangka Raya"]),
+        ("Kalimantan Selatan", ["Banjarmasin"]),
+        ("Kalimantan Timur", ["Samarinda","IKN","Nusantara","Balikpapan"]),
+        ("Kalimantan Utara", ["Tanjung Selor"]),
+        ("Sulawesi Utara", ["Manado"]),
+        ("Gorontalo", ["Gorontalo"]),
+        ("Sulawesi Tengah", ["Palu"]),
+        ("Sulawesi Barat", ["Mamuju"]),
+        ("Sulawesi Selatan", ["Makassar"]),
+        ("Sulawesi Tenggara", ["Kendari"]),
+        ("Maluku", ["Ambon"]),
+        ("Maluku Utara", ["Sofifi","Ternate"]),
+        ("Papua", ["Jayapura"]),
+        ("Papua Barat", ["Manokwari"]),
+        ("Papua Barat Daya", ["Sorong"]),
+        ("Papua Tengah", ["Nabire"]),
+        ("Papua Pegunungan", ["Wamena"]),
+        ("Papua Selatan", ["Merauke"]),
+    ]
+    queries = []
+    for prov, cities in prov_kota:
+        part = " OR ".join([f"demo {prov}"] + [f"demo {c}" for c in cities])
+        queries.append(part)
+    return queries
+
+# Paket query "wide": topik umum + wilayah
+BASE_WIDE_TOPICS = [
+    "demo OR unjuk rasa OR aksi",
+    "protes OR kerusuhan OR ricuh",
+    "demo DPR OR DPRD OR parlemen",
+    "demo polisi OR polda OR polres OR brimob",
+    "Affan OR 'kematian Affan'",
+    "demo mahasiswa OR demo kampus",
+    "demo buruh OR serikat OR mogok",
+]
+
+def build_wide_queries():
+    return BASE_WIDE_TOPICS + build_region_queries()
+
+# =========================
+# Main
+# =========================
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--include", required=True, help="comma-separated keywords include")
+    ap.add_argument("--exclude", default="", help="comma-separated keywords exclude (title only)")
+    ap.add_argument("--when", default="24h", help="12h/24h/48h/72h/7d")
+    ap.add_argument("--province", default=None, help="bias geocode ke provinsi (mis. 'DKI Jakarta')")
+    ap.add_argument("--mode", default="fast", choices=["fast","full"], help="fast=judul saja, full=unduh isi artikel")
+    ap.add_argument("--out", default="demo_out.csv", help="output CSV path")
+    ap.add_argument("--id-media-only", action="store_true", help="Hanya ambil artikel dari media Indonesia")
+    # fitur multi-feed
+    ap.add_argument("--target", type=int, default=500, help="target jumlah artikel (perkiraan)")
+    ap.add_argument("--wide", action="store_true", help="gunakan paket query luas (topik+seluruh provinsi/kota)")
+    ap.add_argument("--queries", default="", help="tambahan query kustom, pisahkan koma")
+    args=ap.parse_args()
+
+    # siapkan daftar query
+    include_terms = [x.strip() for x in args.include.split(",") if x.strip()]
+    base_core     = ["dpr","parlemen","gedung dpr","polisi","polda","polres","brimob","affan"]
+    base_query    = " OR ".join(f"({k})" for k in (include_terms + base_core))
+
+    queries = [base_query]
+    if args.wide:
+        queries.extend(build_wide_queries())
+    if args.queries.strip():
+        queries.extend([q.strip() for q in args.queries.split(",") if q.strip()])
+    # dedup
+    queries = list(dict.fromkeys(queries))
+
+    rows=[]; urls=[]; seen_links=set()
+    exc=[x.strip().lower() for x in args.exclude.split(",") if x.strip()]
+
+    # estimasi feed yang dibutuhkan
+    need_feeds = max(1, math.ceil(args.target / MAX_PER_FEED))
+
+    for qi, q in enumerate(queries, start=1):
+        if len(rows) >= args.target: break
+        feed_url = gnews_rss(q, when=args.when)
+        d = feedparser.parse(feed_url)
+
+        for e in d.entries:
+            if len(rows) >= args.target: break
+            title = getattr(e, "title", "") or ""
+            link  = getattr(e, "link", "") or ""
+            if not link or link in seen_links:
+                continue
+
+            domain = normalize_domain(link)
+            if args.id_media_only and not is_indonesian_media(domain):
+                continue
+            if any(x in title.lower() for x in exc):
+                continue
+
+            seen_links.add(link)
+            published = getattr(e,"published","") or getattr(e,"updated","")
+            rows.append({
+                "id": hashlib.md5(link.encode()).hexdigest(),
+                "title": title,
+                "source_url": link,
+                "source_domain": domain,
+                "published_at_utc": parse_date_utc(published),
+                "q_src": q
+            })
+            urls.append(link)
+
+        if qi >= need_feeds and len(rows) >= args.target:
+            break
+
+    if not rows:
+        pd.DataFrame([]).to_csv(args.out, index=False); print("No results."); return
+
+    # ambil isi artikel jika mode full
+    url2html = asyncio.run(fetch_html(urls, mode=args.mode))
+
+    # ekstraksi lokasi & topik
+    all_cands=set()
+    for r in rows:
+        body = extract_text(url2html.get(r["source_url"],""), r["source_url"]) if args.mode=="full" else ""
+        text=(r["title"] or "")+"\n"+(body or "")
+        locs=extract_locs(text)
+        r["raw_text"]=body[:1500]
+        r["key_phrases"]="; ".join(locs[:10])
+        s=text.lower()
+        r["topic_tag"]=("AFFAN" if "affan" in s else
+                        ("POLISI" if any(k in s for k in ["polisi","brimob","polda","polres","polresta"]) else
+                         ("DPR" if any(k in s for k in ["dpr","parlemen","gedung dpr"]) else "UMUM")))
+        for l in locs[:6]: all_cands.add(l)
+
+    geo_cache=geocode_candidates(sorted(all_cands,key=lambda x:(-len(x),x)), args.province)
+
+    for r in rows:
+        locs=[x.strip() for x in r.get("key_phrases","").split(";") if x.strip()]
+        best=None
+        for cand in locs[:6]:
+            g=geo_cache.get(cand)
+            if g: best=(cand,g); break
+        if best:
+            c,g=best
+            r.update({
+                "mention_phrase":c,
+                "lat":g.get("lat"), "lon":g.get("lon"),
+                "geocoder":g.get("geocoder"), "geocode_score":g.get("score"),
+                "street":g.get("street"), "place_name":g.get("place_name"),
+                "kecamatan":g.get("kecamatan"), "kab_kota":g.get("kab_kota"),
+                "provinsi":g.get("provinsi"),
+            })
+
+    # potong bila > target
+    if len(rows) > args.target:
+        rows = rows[:args.target]
+
+    pd.DataFrame(rows).to_csv(args.out, index=False)
+    print(f"Saved: {args.out} rows={len(rows)} using up to {min(len(queries), need_feeds)} feed(s)")
+    if args.id_media_only:
+        print("Note: filtered to Indonesian media only.")
+
+if __name__ == "__main__":
+    main()
