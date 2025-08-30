@@ -1,0 +1,15 @@
+streamlit
+streamlit-folium
+folium
+feedparser
+trafilatura
+lxml
+dateparser
+spacy
+geopy
+requests
+pandas
+numpy
+rapidfuzz
+shapely
+pyproj
