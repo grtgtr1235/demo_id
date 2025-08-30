@@ -1,7 +1,14 @@
 import streamlit as st, pandas as pd, subprocess, sys, os
-from streamlit_folium import st_folium
 import folium
 from folium.plugins import MarkerCluster
+
+# Try streamlit_folium; fallback to components.html
+try:
+    from streamlit_folium import st_folium
+    def render_map(m): st_folium(m, height=650, use_container_width=True)
+except Exception:
+    import streamlit.components.v1 as components
+    def render_map(m): components.html(m._repr_html_(), height=650, scrolling=False)
 
 st.set_page_config(page_title="Peta Demo/Protes Indonesia", layout="wide")
 st.title("Peta Demo/Protes Indonesia (Crawler Gratis)")
@@ -28,7 +35,7 @@ def draw_map(df):
             """, max_width=350)
             folium.Marker([r["lat"], r["lon"]],
                           tooltip=r.get("topic_tag",""), popup=popup).add_to(mc)
-    st_folium(m, height=650, use_container_width=True)
+    render_map(m)
 
 if run:
     out = "result.csv"
@@ -40,7 +47,8 @@ if run:
     st.success("Selesai. Hasil terbaru di bawah.")
     if os.path.exists(out):
         df = pd.read_csv(out)
-        st.dataframe(df[["published_at_utc","title","topic_tag","mention_phrase","kecamatan","kab_kota","provinsi","source_domain"]], use_container_width=True)
+        cols = [c for c in ["published_at_utc","title","topic_tag","mention_phrase","kecamatan","kab_kota","provinsi","source_domain"] if c in df.columns]
+        st.dataframe(df[cols], use_container_width=True)
         draw_map(df)
     else:
         st.warning("Tidak ada file hasil.")
