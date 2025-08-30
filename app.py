@@ -2,6 +2,7 @@ import streamlit as st, pandas as pd, subprocess, sys, os
 import folium
 from folium.plugins import MarkerCluster
 
+# --- Peta Folium: pakai streamlit_folium jika ada, kalau tidak fallback ke components.html
 try:
     from streamlit_folium import st_folium
     def render_map(m): st_folium(m, height=650, use_container_width=True)
@@ -10,8 +11,9 @@ except Exception:
     def render_map(m): components.html(m._repr_html_(), height=650, scrolling=False)
 
 st.set_page_config(page_title="Peta Demo/Protes Indonesia", layout="wide")
-st.title("Peta Demo/Protes Indonesia (Crawler Gratis)")
+st.title("Peta Demo/Protes Indonesia (News Crawler)")
 
+# ------------------------ Sidebar (kontrol crawling) ------------------------
 with st.sidebar:
     st.header("Filter Crawling")
     inc = st.text_input("Keyword include (koma)", "demo,protes,kerusuhan")
@@ -20,42 +22,116 @@ with st.sidebar:
     mode = st.radio("Mode crawling", ["fast (judul)", "full (ambil isi)"], index=0)
     run = st.button("Jalankan Crawling")
 
-def draw_map(df):
-    m = folium.Map(location=[-2.5,117], zoom_start=5, control_scale=True)
-    if df is not None and not df.empty and {"lat","lon"}.issubset(df.columns):
-        mc = MarkerCluster().add_to(m)
-        for _,r in df.dropna(subset=["lat","lon"]).iterrows():
-            popup = folium.Popup(f"""
-            <b>{r.get('title','')}</b><br>
-            <i>{r.get('mention_phrase','')}</i><br>
-            {(r.get('street') or r.get('place_name') or '')}<br>
-            {(r.get('kecamatan','') or '')}, {(r.get('kab_kota','') or '')}, {(r.get('provinsi','') or '')}<br>
-            <a href="{r.get('source_url','')}" target="_blank">Baca sumber</a>
-            """, max_width=350)
-            folium.Marker([r["lat"], r["lon"]],
-                          tooltip=r.get("topic_tag",""), popup=popup).add_to(mc)
-    render_map(m)
+# ------------------------ Helper ------------------------
+RESULT_PATH = "result.csv"
 
-if run:
-    out = "result.csv"
-    cmd = [sys.executable, "rss_crawl_fast.py", "--include", inc, "--when", when,
-           "--mode", "fast" if mode.startswith("fast") else "full", "--out", out]
+def run_crawl():
+    cmd = [sys.executable, "rss_crawl_fast.py",
+           "--include", inc,
+           "--when", when,
+           "--mode", "fast" if mode.startswith("fast") else "full",
+           "--out", RESULT_PATH]
     if province.strip():
         cmd += ["--province", province.strip()]
     with st.spinner("Crawling..."):
         subprocess.run(cmd, check=False)
+
+def load_df():
+    if not os.path.exists(RESULT_PATH):
+        return pd.DataFrame()
+    df = pd.read_csv(RESULT_PATH)
+    # normalisasi kolom waktu → datetime
+    if "published_at_utc" in df.columns:
+        df["published_at_utc"] = pd.to_datetime(df["published_at_utc"], errors="coerce", utc=True)
+    return df
+
+def draw_map(df):
+    m = folium.Map(location=[-2.5, 117], zoom_start=5, control_scale=True)
+    if df is not None and not df.empty and {"lat","lon"}.issubset(df.columns):
+        mc = MarkerCluster().add_to(m)
+        for _, r in df.dropna(subset=["lat","lon"]).iterrows():
+            popup = folium.Popup(f"""
+                <b>{r.get('title','')}</b><br>
+                <i>{r.get('mention_phrase','')}</i><br>
+                {(r.get('street') or r.get('place_name') or '')}<br>
+                {(r.get('kecamatan','') or '')}, {(r.get('kab_kota','') or '')}, {(r.get('provinsi','') or '')}<br>
+                <a href="{r.get('source_url','')}" target="_blank">Baca sumber</a>
+            """, max_width=350)
+            folium.Marker(
+                [r["lat"], r["lon"]],
+                tooltip=r.get("topic_tag",""),
+                popup=popup
+            ).add_to(mc)
+    render_map(m)
+
+# ------------------------ Jalankan crawling jika diminta ------------------------
+if run:
+    run_crawl()
     st.success("Selesai. Hasil terbaru di bawah.")
-    if os.path.exists(out):
-        df = pd.read_csv(out)
-        cols = [c for c in ["published_at_utc","title","topic_tag","mention_phrase",
-                            "kecamatan","kab_kota","provinsi","source_domain"] if c in df.columns]
-        st.dataframe(df[cols], use_container_width=True)
-        draw_map(df)
+
+# ------------------------ Muat data & UI utama ------------------------
+df = load_df()
+
+# Tabs: Peta & Tabel
+tab_map, tab_table = st.tabs(["🗺️ Peta", "📊 Tabel"])
+
+with tab_map:
+    if df.empty:
+        st.warning("Tidak ada file hasil. Klik **Jalankan Crawling** di sidebar.")
     else:
-        st.warning("Tidak ada file hasil.")
-else:
-    st.info("Isi filter di kiri dan klik 'Jalankan Crawling'.")
-    draw_map(pd.DataFrame())
+        # ringkasan kecil
+        c1, c2, c3 = st.columns(3)
+        with c1: st.metric("Total artikel", len(df))
+        with c2: st.metric("Berhasil di-geocode", int(df[["lat","lon"]].notna().all(axis=1).sum()))
+        with c3: st.metric("Sumber unik", df["source_domain"].nunique() if "source_domain" in df.columns else 0)
+        draw_map(df)
+
+with tab_table:
+    if df.empty:
+        st.info("Belum ada data untuk ditampilkan.")
+    else:
+        # ---------------- Filters tabel ----------------
+        col_f1, col_f2, col_f3 = st.columns([1,1,2])
+        with col_f1:
+            topics = sorted([x for x in df["topic_tag"].dropna().unique()]) if "topic_tag" in df.columns else []
+            sel_topics = st.multiselect("Filter topik", topics, default=topics)
+        with col_f2:
+            provs = sorted([x for x in df["provinsi"].dropna().unique()]) if "provinsi" in df.columns else []
+            sel_prov = st.multiselect("Filter provinsi", provs, default=provs[:10] if len(provs)>10 else provs)
+        with col_f3:
+            if "published_at_utc" in df.columns and df["published_at_utc"].notna().any():
+                min_d = pd.to_datetime(df["published_at_utc"].min()).date()
+                max_d = pd.to_datetime(df["published_at_utc"].max()).date()
+                dr = st.date_input("Rentang tanggal (UTC)", (min_d, max_d))
+            else:
+                dr = None
+
+        df_f = df.copy()
+        if "topic_tag" in df_f.columns and sel_topics:
+            df_f = df_f[df_f["topic_tag"].isin(sel_topics)]
+        if "provinsi" in df_f.columns and sel_prov:
+            df_f = df_f[df_f["provinsi"].isin(sel_prov)]
+        if dr and isinstance(dr, tuple) and len(dr) == 2 and "published_at_utc" in df_f.columns:
+            start, end = pd.to_datetime(dr[0]), pd.to_datetime(dr[1]) + pd.Timedelta(days=1)
+            df_f = df_f[(df_f["published_at_utc"] >= start) & (df_f["published_at_utc"] < end)]
+
+        # Kolom yang rapih untuk tabel
+        show_cols = [c for c in [
+            "published_at_utc","title","topic_tag","mention_phrase",
+            "street","place_name","kecamatan","kab_kota","provinsi",
+            "geocoder","geocode_score","source_domain","source_url"
+        ] if c in df_f.columns]
+
+        st.dataframe(df_f[show_cols].sort_values("published_at_utc", ascending=False, na_position="last"),
+                     use_container_width=True, height=520)
+
+        # Download CSV hasil filter
+        st.download_button(
+            "⬇️ Unduh CSV (hasil filter)",
+            data=df_f[show_cols].to_csv(index=False).encode("utf-8"),
+            file_name="demo_crawl_filtered.csv",
+            mime="text/csv"
+        )
 
 st.markdown("---")
-st.caption("Tips: tambah kata kunci seperti 'DPR', 'DPRD', 'Polda', 'Polres', 'Senayan', 'Affan'.")
+st.caption("Tips: tambah kata kunci seperti 'DPR', 'DPRD', 'Polri', 'Polda', 'Polres', 'Senayan', 'Affan'.")
