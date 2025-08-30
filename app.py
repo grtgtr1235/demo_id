@@ -3,7 +3,9 @@ import folium
 from folium.plugins import MarkerCluster
 from zoneinfo import ZoneInfo
 
-# Folium renderer: prefer streamlit_folium; fallback ke components.html
+# =========================
+# Render peta: pakai streamlit_folium jika ada; jika tidak, fallback ke components.html
+# =========================
 try:
     from streamlit_folium import st_folium
     def render_map(m): st_folium(m, height=650, use_container_width=True)
@@ -11,12 +13,18 @@ except Exception:
     import streamlit.components.v1 as components
     def render_map(m): components.html(m._repr_html_(), height=650, scrolling=False)
 
-TZ = ZoneInfo("Asia/Jakarta")  # GMT+7
+# =========================
+# Konfigurasi umum
+# =========================
+TZ = ZoneInfo("Asia/Jakarta")          # GMT+7
+RESULT_PATH = "result.csv"
 
 st.set_page_config(page_title="Peta Demo/Protes Indonesia", layout="wide")
 st.title("Peta Demo/Protes Indonesia (News Crawler)")
 
-# ---------------- Sidebar ----------------
+# =========================
+# Sidebar (kontrol crawling)
+# =========================
 with st.sidebar:
     st.header("Filter Crawling")
     inc = st.text_input("Keyword include (koma)", "demo,protes,kerusuhan")
@@ -26,9 +34,11 @@ with st.sidebar:
     id_only = st.checkbox("Hanya media Indonesia", value=True)
     run = st.button("Jalankan Crawling")
 
-RESULT_PATH = "result.csv"
-
+# =========================
+# Helper
+# =========================
 def run_crawl():
+    """Jalankan crawler sebagai proses terpisah."""
     cmd = [sys.executable, "rss_crawl_fast.py",
            "--include", inc,
            "--when", when,
@@ -41,22 +51,28 @@ def run_crawl():
     with st.spinner("Crawling..."):
         subprocess.run(cmd, check=False)
 
-def load_df():
-    if not os.path.exists(RESULT_PATH):
+def load_df() -> pd.DataFrame:
+    """Muat CSV hasil crawling. Aman jika file kosong atau belum ada.
+    Tambahkan kolom waktu GMT+7 untuk tampilan & filter."""
+    if not os.path.exists(RESULT_PATH) or os.path.getsize(RESULT_PATH) == 0:
         return pd.DataFrame()
-    df = pd.read_csv(RESULT_PATH)
-    # published_at_utc -> datetime UTC → kolom lokal (GMT+7) untuk filter/tampilan
+    try:
+        df = pd.read_csv(RESULT_PATH)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
     if "published_at_utc" in df.columns:
         utc = pd.to_datetime(df["published_at_utc"], errors="coerce", utc=True)
         df["published_at_utc"] = utc
         df["published_at_gmt7"] = utc.dt.tz_convert(TZ)
     return df
 
-def draw_map(df):
-    m = folium.Map(location=[-2.5,117], zoom_start=5, control_scale=True)
+def draw_map(df: pd.DataFrame):
+    """Gambar peta Folium dengan marker cluster."""
+    m = folium.Map(location=[-2.5, 117], zoom_start=5, control_scale=True)
     if df is not None and not df.empty and {"lat","lon"}.issubset(df.columns):
         mc = MarkerCluster().add_to(m)
-        for _,r in df.dropna(subset=["lat","lon"]).iterrows():
+        for _, r in df.dropna(subset=["lat","lon"]).iterrows():
             popup = folium.Popup(f"""
                 <b>{r.get('title','')}</b><br>
                 <small>{r.get('published_at_gmt7')}</small><br>
@@ -65,25 +81,31 @@ def draw_map(df):
                 {(r.get('kecamatan','') or '')}, {(r.get('kab_kota','') or '')}, {(r.get('provinsi','') or '')}<br>
                 <a href="{r.get('source_url','')}" target="_blank">Baca sumber</a>
             """, max_width=350)
-            folium.Marker([r["lat"], r["lon"]],
-                          tooltip=r.get("topic_tag",""), popup=popup).add_to(mc)
+            folium.Marker(
+                [r["lat"], r["lon"]],
+                tooltip=r.get("topic_tag",""),
+                popup=popup
+            ).add_to(mc)
     render_map(m)
 
-# Run crawl bila diminta
+# =========================
+# Eksekusi crawling bila tombol ditekan
+# =========================
 if run:
     run_crawl()
     st.success("Selesai. Hasil terbaru di bawah.")
 
+# =========================
+# Muat data & bangun UI (Tabs)
+# =========================
 df = load_df()
-
-# Tabs Peta / Tabel
 tab_map, tab_table = st.tabs(["🗺️ Peta", "📊 Tabel"])
 
 with tab_map:
     if df.empty:
         st.warning("Belum ada data. Klik **Jalankan Crawling** di sidebar.")
     else:
-        c1,c2,c3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
         with c1: st.metric("Total artikel", len(df))
         with c2: st.metric("Titik tergeocode", int(df[["lat","lon"]].notna().all(axis=1).sum()))
         with c3: st.metric("Sumber unik", df["source_domain"].nunique() if "source_domain" in df.columns else 0)
@@ -93,13 +115,13 @@ with tab_table:
     if df.empty:
         st.info("Belum ada data untuk ditampilkan.")
     else:
-        # --------- Filter tabel ---------
+        # ---------- Filter tabel ----------
         col1, col2, col3 = st.columns([1,1,2])
         with col1:
-            topics = sorted([x for x in df.get("topic_tag", pd.Series()).dropna().unique()]) if "topic_tag" in df.columns else []
+            topics = sorted(df["topic_tag"].dropna().unique()) if "topic_tag" in df.columns else []
             sel_topics = st.multiselect("Filter topik", topics, default=topics)
         with col2:
-            provs = sorted([x for x in df.get("provinsi", pd.Series()).dropna().unique()]) if "provinsi" in df.columns else []
+            provs = sorted(df["provinsi"].dropna().unique()) if "provinsi" in df.columns else []
             sel_prov = st.multiselect("Filter provinsi", provs, default=provs[:10] if len(provs)>10 else provs)
         with col3:
             if "published_at_gmt7" in df.columns and df["published_at_gmt7"].notna().any():
@@ -115,10 +137,9 @@ with tab_table:
         if "provinsi" in df_f.columns and sel_prov:
             df_f = df_f[df_f["provinsi"].isin(sel_prov)]
         if dr and isinstance(dr, tuple) and len(dr) == 2 and "published_at_gmt7" in df_f.columns:
-            # Buat batas start/end timezone-aware GMT+7
-            start = pd.to_datetime(dr[0]).tz_localize(TZ)
-            # end di-set ke akhir hari
-            end = (pd.to_datetime(dr[1]) + pd.Timedelta(days=1)).tz_localize(TZ)
+            # batas tz-aware di GMT+7; end eksklusif (tambah 1 hari)
+            start = pd.Timestamp(dr[0], tz=TZ)
+            end = pd.Timestamp(dr[1], tz=TZ) + pd.Timedelta(days=1)
             df_f = df_f[(df_f["published_at_gmt7"] >= start) & (df_f["published_at_gmt7"] < end)]
 
         show_cols = [c for c in [
@@ -126,8 +147,11 @@ with tab_table:
             "street","place_name","kecamatan","kab_kota","provinsi",
             "geocoder","geocode_score","source_domain","source_url"
         ] if c in df_f.columns]
-        st.dataframe(df_f[show_cols].sort_values("published_at_gmt7", ascending=False, na_position="last"),
-                     use_container_width=True, height=520)
+
+        st.dataframe(
+            df_f[show_cols].sort_values("published_at_gmt7", ascending=False, na_position="last"),
+            use_container_width=True, height=520
+        )
 
         st.download_button(
             "⬇️ Unduh CSV (hasil filter, GMT+7)",
@@ -137,4 +161,4 @@ with tab_table:
         )
 
 st.markdown("---")
-st.caption("Waktu ditampilkan di GMT+7 (Asia/Jakarta). Sumber dibatasi ke media Indonesia bila opsi dicentang.")
+st.caption("Waktu ditampilkan dalam GMT+7 (Asia/Jakarta). Aktifkan 'Hanya media Indonesia' di sidebar untuk menyaring domain non-ID.")
