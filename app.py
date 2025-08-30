@@ -2,7 +2,6 @@ import streamlit as st, pandas as pd, subprocess, sys, os
 import folium
 from folium.plugins import MarkerCluster
 
-# Try streamlit_folium; fallback to components.html
 try:
     from streamlit_folium import st_folium
     def render_map(m): st_folium(m, height=650, use_container_width=True)
@@ -39,7 +38,8 @@ def draw_map(df):
 
 if run:
     out = "result.csv"
-    cmd = [sys.executable, "rss_crawl_fast.py", "--include", inc, "--when", when, "--mode", "fast" if mode.startswith("fast") else "full", "--out", out]
+    cmd = [sys.executable, "rss_crawl_fast.py", "--include", inc, "--when", when,
+           "--mode", "fast" if mode.startswith("fast") else "full", "--out", out]
     if province.strip():
         cmd += ["--province", province.strip()]
     with st.spinner("Crawling..."):
@@ -47,14 +47,15 @@ if run:
     st.success("Selesai. Hasil terbaru di bawah.")
     if os.path.exists(out):
         df = pd.read_csv(out)
-        cols = [c for c in ["published_at_utc","title","topic_tag","mention_phrase","kecamatan","kab_kota","provinsi","source_domain"] if c in df.columns]
+        cols = [c for c in ["published_at_utc","title","topic_tag","mention_phrase",
+                            "kecamatan","kab_kota","provinsi","source_domain"] if c in df.columns]
         st.dataframe(df[cols], use_container_width=True)
         draw_map(df)
     else:
         st.warning("Tidak ada file hasil.")
 else:
     st.info("Isi filter di kiri dan klik 'Jalankan Crawling'.")
-    draw_map(pd.DataFrame())  # tampilkan basemap dulu
+    draw_map(pd.DataFrame())
 
 st.markdown("---")
 st.caption("Tips: tambah kata kunci seperti 'DPR', 'DPRD', 'Polda', 'Polres', 'Senayan', 'Affan'.")
