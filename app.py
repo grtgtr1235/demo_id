@@ -17,28 +17,12 @@ with st.sidebar:
     st.caption("Gunakan rentang sempit untuk build lebih cepat.")
     run = st.button("Jalankan Crawler")
 
-@st.cache_data(show_spinner=True)
-def run_crawl(inc, exc, when):
-    inc_list = [x.strip() for x in inc.split(",") if x.strip()]
-    exc_list = [x.strip() for x in exc.split(",") if x.strip()]
-    df = crawl_once(inc_list, exc_list, when=when, province_bias=None)
-    return df
-
-if run:
-    df = run_crawl(inc, exc, when)
-    if len(df)==0:
-        st.warning("Tidak ada hasil. Coba perluas kata kunci atau rentang waktu.")
-    else:
-        if scope != "Semua":
-            df = df[df["topic_tag"] == scope]
-        st.success(f"Total hasil: {len(df)}")
-        show_cols = ["published_at_utc","title","topic_tag","mention_phrase","kecamatan","kab_kota","provinsi","source_domain"]
-        st.dataframe(df[show_cols], use_container_width=True)
-
-        # Peta
-        m = folium.Map(location=[-2.5, 117], zoom_start=5, control_scale=True)
+# ---------- Selalu buat peta dasar ----------
+def render_map(df_points: pd.DataFrame | None):
+    m = folium.Map(location=[-2.5, 117], zoom_start=5, control_scale=True)
+    if df_points is not None and len(df_points.dropna(subset=["lat","lon"])) > 0:
         mc = MarkerCluster().add_to(m)
-        for _,r in df.dropna(subset=["lat","lon"]).iterrows():
+        for _, r in df_points.dropna(subset=["lat","lon"]).iterrows():
             popup = folium.Popup('''
             <b>{title}</b><br>
             <i>{mention}</i><br>
@@ -56,10 +40,27 @@ if run:
             ), max_width=350)
             folium.Marker([r["lat"], r["lon"]],
                           tooltip=r["topic_tag"], popup=popup).add_to(mc)
-        st_folium(m, height=650, use_container_width=True)
+    st_folium(m, height=650, use_container_width=True)
 
-        st.download_button("Unduh CSV", df.to_csv(index=False).encode("utf-8"),
-                           "demo_mapper.csv", "text/csv")
+@st.cache_data(show_spinner=True)
+def run_crawl(inc, exc, when):
+    inc_list = [x.strip() for x in inc.split(",") if x.strip()]
+    exc_list = [x.strip() for x in exc.split(",") if x.strip()]
+    df = crawl_once(inc_list, exc_list, when=when, province_bias=None)
+    return df
 
-st.markdown("---")
-st.caption("💡 Tips: tambah kata kunci spesifik seperti 'DPRD', 'Polda', 'Polres', 'Gedung DPR', 'Senayan', 'Affan'.")
+df = None
+if run:
+    df = run_crawl(inc, exc, when)
+    if scope != "Semua" and df is not None and not df.empty:
+        df = df[df["topic_tag"] == scope]
+    if df is None or df.empty:
+        st.warning("Tidak ada hasil untuk filter tersebut. Coba keyword lebih spesifik (mis. 'DPRD', 'Polda', 'Polres', 'Senayan', 'Affan') atau ubah rentang waktu.")
+    else:
+        st.success(f"Total hasil: {len(df)}")
+        show_cols = ["published_at_utc","title","topic_tag","mention_phrase",
+                     "kecamatan","kab_kota","provinsi","source_domain"]
+        st.dataframe(df[show_cols], use_container_width=True)
+
+# render peta (selalu tampil; jika df None/empty, hanya basemap)
+render_map(df)
