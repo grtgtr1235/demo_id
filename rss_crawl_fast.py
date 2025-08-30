@@ -10,17 +10,21 @@ import pandas as pd
 import requests
 import trafilatura
 import dateparser
+from zoneinfo import ZoneInfo
+
+# =========================
+# KONFIGURASI
+# =========================
+UA = os.getenv("APP_USER_AGENT", "id-demo-mapper/1.5 (contact: you@example.com)")
+PHOTON = "https://photon.komoot.io/api"
+TZ_JKT = ZoneInfo("Asia/Jakarta")  # GMT+7
 
 # =========================
 # NER (spaCy) dengan fallback
 # =========================
 _NLP = None
 def ensure_nlp():
-    """
-    Coba load spaCy model multilingual kecil `xx_ent_wiki_sm`.
-    Jika gagal (host melarang/install gagal), kembalikan None,
-    dan pipeline tetap berjalan dengan regex alamat.
-    """
+    """Coba load spaCy model multilingual kecil; jika gagal -> None (pakai regex saja)."""
     global _NLP
     if _NLP is not None:
         return _NLP
@@ -52,9 +56,6 @@ PRIORITY_PLACES = {
     "monas": (-6.175392, 106.827153, "Monumen Nasional"),
 }
 
-UA = os.getenv("APP_USER_AGENT", "id-demo-mapper/1.4 (contact: you@example.com)")
-PHOTON = "https://photon.komoot.io/api"
-
 # =========================
 # Nominatim (OSM) fallback dengan RateLimiter
 # =========================
@@ -64,17 +65,37 @@ _GEOCODER = Nominatim(user_agent=UA, timeout=20)
 _geocode = RateLimiter(_GEOCODER.geocode, min_delay_seconds=1.1, swallow_exceptions=True)
 
 # =========================
-# Util
+# Utils
 # =========================
 def gnews_rss(query, when="24h", lang="id", country="ID"):
     q = quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}+when:{when}&hl={lang}&gl={country}&ceid={country}:{lang}"
 
-def parse_date_any(s):
+def parse_date_both(s: str):
+    """
+    Kembalikan tuple (utc_iso, gmt7_iso).
+    Pakai dateparser timezone-aware; jika sumber tidak bertz → asumsi UTC.
+    """
     if not s:
-        return None
-    dt = dateparser.parse(s, languages=["id", "en"])
-    return dt.isoformat() if dt else None
+        return None, None
+    dt = dateparser.parse(
+        s,
+        languages=["id", "en"],
+        settings={"RETURN_AS_TIMEZONE_AWARE": True}
+    )
+    if dt is None:
+        return None, None
+    # normalisasi ke UTC
+    dt_utc = dt.astimezone(ZoneInfo("UTC"))
+    # dan ke GMT+7
+    dt_jkt = dt.astimezone(TZ_JKT)
+    return dt_utc.isoformat(), dt_jkt.isoformat()
+
+def normalize_domain(url: str) -> str:
+    d = urlparse(url).netloc.lower()
+    if d.startswith("www."): d = d[4:]
+    if d.startswith("amp."): d = d[4:]
+    return d
 
 def is_indonesian_media(domain: str) -> bool:
     """Heuristik: TLD .id atau domain media Indonesia populer."""
@@ -88,12 +109,12 @@ def is_indonesian_media(domain: str) -> bool:
         "liputan6.com","merdeka.com","republika.co.id","antaranews.com","tribunnews.com",
         "jawapos.com","okezone.com","sindonews.com","kumparan.com","tirto.id","suara.com",
         "inews.id","medcom.id","viva.co.id","idntimes.com","rmol.id","pikiran-rakyat.com",
-        "beritasatu.com","asephardiyansyah.com"  # tambah sesuai kebutuhan
+        "beritasatu.com"
     ]
     return any(d.endswith(w) for w in whitelist)
 
 def extract_locs(text):
-    """Gabungkan NER (jika tersedia) + regex alamat → daftar kandidat lokasi."""
+    """Gabungkan NER (jika tersedia) + regex alamat → daftar kandidat lokasi unik."""
     nlp = ensure_nlp()
     locs = []
     if text:
@@ -105,55 +126,35 @@ def extract_locs(text):
     for l in locs:
         k = l.lower()
         if k not in seen and len(l) >= 3:
-            uniq.append(l)
-            seen.add(k)
+            uniq.append(l); seen.add(k)
     # urutkan: frasa lebih panjang → lebih dulu
     uniq.sort(key=lambda x: (-len(x), x))
     return uniq
 
 def classify_topic(text):
     s = (text or "").lower()
-    if "affan" in s:
-        return "AFFAN"
-    if any(k in s for k in ["polisi", "brimob", "polda", "polres", "polresta"]):
-        return "POLISI"
-    if any(k in s for k in ["dpr", "parlemen", "gedung dpr"]):
-        return "DPR"
+    if "affan" in s: return "AFFAN"
+    if any(k in s for k in ["polisi","brimob","polda","polres","polresta"]): return "POLISI"
+    if any(k in s for k in ["dpr","parlemen","gedung dpr"]): return "DPR"
     return "UMUM"
 
 def geo_priority(q_lower):
     for k, (lat, lon, name) in PRIORITY_PLACES.items():
         if k in q_lower:
-            return {
-                "lat": lat,
-                "lon": lon,
-                "place_name": name,
-                "geocoder": "priority",
-                "score": 1.0,
-            }
+            return {"lat": lat, "lon": lon, "place_name": name, "geocoder": "priority", "score": 1.0}
 
 def geo_photon(q, province=None):
     try:
         qs = q if not province else f"{q}, {province}"
-        r = requests.get(
-            PHOTON,
-            params={"q": qs, "lang": "id"},
-            timeout=15,
-            headers={"User-Agent": UA},
-        )
+        r = requests.get(PHOTON, params={"q": qs, "lang": "id"}, timeout=15, headers={"User-Agent": UA})
         r.raise_for_status()
         feats = r.json().get("features", [])
         if feats:
-            f = feats[0]
-            lon, lat = f["geometry"]["coordinates"]
+            f = feats[0]; lon, lat = f["geometry"]["coordinates"]
             p = f.get("properties", {})
             return {
-                "lat": lat,
-                "lon": lon,
-                "geocoder": "photon",
-                "score": 0.6,
-                "street": p.get("street"),
-                "place_name": p.get("name"),
+                "lat": lat, "lon": lon, "geocoder": "photon", "score": 0.6,
+                "street": p.get("street"), "place_name": p.get("name"),
                 "kecamatan": p.get("city_district") or p.get("suburb"),
                 "kab_kota": p.get("city") or p.get("county"),
                 "provinsi": p.get("state"),
@@ -168,10 +169,7 @@ def geo_nominatim(q, province=None):
         if res:
             a = res.raw.get("address", {})
             return {
-                "lat": res.latitude,
-                "lon": res.longitude,
-                "geocoder": "nominatim",
-                "score": 0.8,
+                "lat": res.latitude, "lon": res.longitude, "geocoder": "nominatim", "score": 0.8,
                 "street": a.get("road") or a.get("pedestrian"),
                 "place_name": a.get("public_building") or a.get("tourism") or a.get("building"),
                 "kecamatan": a.get("suburb") or a.get("city_district") or a.get("district"),
@@ -193,11 +191,9 @@ def geocode_candidates(cands, province=None, cache_path="geocode_cache.json"):
     for cand in cands:
         key = cand.lower() + ("|" + province.lower() if province else "")
         if key in cache:
-            out[cand] = cache[key]
-            continue
+            out[cand] = cache[key]; continue
         hit = geo_priority(key) or geo_photon(cand, province) or geo_nominatim(cand, province)
-        out[cand] = hit
-        cache[key] = hit
+        out[cand] = hit; cache[key] = hit
         time.sleep(0.1)  # kecilkan rate
     try:
         json.dump(cache, open(cache_path, "w", encoding="utf-8"))
@@ -205,28 +201,30 @@ def geocode_candidates(cands, province=None, cache_path="geocode_cache.json"):
         pass
     return out
 
-async def fetch_html(urls, mode="fast"):
-    """Ambil HTML paralel (hanya jika mode==full)."""
-    if mode == "fast":
+# =========================
+# Fetch HTML paralel (batasi concurrency)
+# =========================
+async def fetch_html(urls, mode="fast", max_concurrency=12):
+    if mode == "fast":  # tidak ambil isi → hemat waktu
         return {u: "" for u in urls}
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+
+    sem = asyncio.Semaphore(max_concurrency)
+    async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": UA}) as client:
         async def one(u):
-            try:
-                r = await client.get(u, headers={"User-Agent": UA}, timeout=25)
-                r.raise_for_status()
-                return u, r.text
-            except Exception:
-                return u, ""
+            async with sem:
+                try:
+                    r = await client.get(u, timeout=25)
+                    r.raise_for_status()
+                    return u, r.text
+                except Exception:
+                    return u, ""
         res = await asyncio.gather(*[one(u) for u in urls])
         return dict(res)
 
 def extract_text(html, url):
-    if not html:
-        return ""
+    if not html: return ""
     try:
-        return trafilatura.extract(
-            html, include_comments=False, include_tables=False, url=url
-        ) or ""
+        return trafilatura.extract(html, include_comments=False, include_tables=False, url=url) or ""
     except Exception:
         return ""
 
@@ -255,24 +253,34 @@ def main():
     d = feedparser.parse(feed_url)
 
     rows = []
+    seen_links = set()
     urls = []
+
     for e in d.entries:
-        title = e.title
-        if any(x in title.lower() for x in exc):
+        title = e.title or ""
+        link = getattr(e, "link", "")
+        if not link or link in seen_links:
             continue
-        link = e.link
-        domain = urlparse(link).netloc
+        seen_links.add(link)
+
+        domain = normalize_domain(link)
         if args.id_media_only and not is_indonesian_media(domain):
             continue
 
-        published = getattr(e, "published", "") or getattr(e, "updated", "")
+        if any(x in title.lower() for x in exc):
+            continue
+
+        published_raw = getattr(e, "published", "") or getattr(e, "updated", "")
+        utc_iso, jkt_iso = parse_date_both(published_raw)
+
         rows.append(
             {
                 "id": hashlib.md5(link.encode()).hexdigest(),
                 "title": title,
                 "source_url": link,
                 "source_domain": domain,
-                "published_at_utc": parse_date_any(published),
+                "published_at_utc": utc_iso,
+                "published_at_gmt7": jkt_iso,
             }
         )
         urls.append(link)
@@ -312,24 +320,17 @@ def main():
         for cand in locs[:6]:
             g = geo_cache.get(cand)
             if g:
-                best = (cand, g)
-                break
+                best = (cand, g); break
         if best:
             c, g = best
-            r.update(
-                {
-                    "mention_phrase": c,
-                    "lat": g.get("lat"),
-                    "lon": g.get("lon"),
-                    "geocoder": g.get("geocoder"),
-                    "geocode_score": g.get("score"),
-                    "street": g.get("street"),
-                    "place_name": g.get("place_name"),
-                    "kecamatan": g.get("kecamatan"),
-                    "kab_kota": g.get("kab_kota"),
-                    "provinsi": g.get("provinsi"),
-                }
-            )
+            r.update({
+                "mention_phrase": c,
+                "lat": g.get("lat"), "lon": g.get("lon"),
+                "geocoder": g.get("geocoder"), "geocode_score": g.get("score"),
+                "street": g.get("street"), "place_name": g.get("place_name"),
+                "kecamatan": g.get("kecamatan"), "kab_kota": g.get("kab_kota"),
+                "provinsi": g.get("provinsi"),
+            })
 
     pd.DataFrame(rows).to_csv(args.out, index=False)
     print(f"Saved: {args.out} rows={len(rows)}")
